@@ -1,0 +1,14 @@
+name: Manual API Test
+on: workflow_dispatch  # Toto povolí to "tlačítko"
+
+jobs:
+  check-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Czechia API
+        run: |
+          # Tady zkusíme přímo ten curl, abychom viděli čistou odpověď
+          curl -i -X POST "https://api.czechia.com/api/DNS/zoner-test.eu/TXT" \
+          -H "AuthorizationToken: ${{ secrets.TokenValue1 }}" \
+          -H "Content-Type: application/json" \
+          -d '{"hostName":"github-test","text":"github","ttl":3600,"publishZone":1}'
