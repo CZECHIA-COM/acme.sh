@@ -47,6 +47,7 @@ jobs:
 
   Docker:
     runs-on: ubuntu-latest
+    environment: Testing
     needs: CheckToken
     if: "contains(needs.CheckToken.outputs.hasToken, 'true')"
     env:
