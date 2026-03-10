@@ -1,0 +1,64 @@
+name: Direct API Debug Test
+on: [push, workflow_dispatch]
+
+jobs:
+  debug-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Direct Curl Test
+        env:
+          CZ_Token: ${{ secrets.CZ_TOKEN }}
+          CZ_Domain: "zoner-test.eu"
+        run: |
+          # 1. Kontrola, zda máme token (vypíše jen délku pro bezpečnost)
+          echo "Token length: ${#CZ_Token}"
+          
+          # 2. Načtení skriptu a test parsování (vložíme tam debug výpisy)
+          # Simulujeme chování acme.sh
+          _info() { echo "[INFO] $@"; }
+          _debug() { echo "[DEBUG] $@"; }
+          _debug2() { echo "[DEBUG2] $@"; }
+          _err() { echo "[ERR] $@"; >&2; }
+          
+          # Mockování acme.sh funkcí pro POST/DELETE
+          _post() {
+            curl -v -sS -X POST "$2" \
+              -H "Content-Type: application/json" \
+              -H "AuthorizationToken: $CZ_Token" \
+              -d "$1"
+          }
+
+          # 3. Zkusíme přímo zavolat přidání záznamu (simulace dns_czechia_add)
+          # Tady si ověříme, jak se skládá URL a BODY
+          echo "--- START DIRECT API TEST ---"
+          
+          # Testovací hodnoty
+          _sub_domain="_acme-challenge"
+          _domain="$CZ_Domain"
+          _txtvalue="vceratofungovalo-dnesne-$(date +%s)"
+          
+          echo "Target Domain: $_domain"
+          echo "Target Subdomain: $_sub_domain"
+          
+          # Simulace těla požadavku (všimni si TTL 300)
+          body="{\"hostName\":\"$_sub_domain\",\"text\":\"$_txtvalue\",\"ttl\":300,\"publishZone\":1}"
+          url="https://api.czechia.com/api/DNS/$_domain/TXT"
+          
+          echo "Sending to URL: $url"
+          echo "Sending Body: $body"
+          
+          # Samotný výstřel na API
+          response=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$url" \
+            -H "Content-Type: application/json" \
+            -H "AuthorizationToken: $CZ_Token" \
+            -d "$body")
+          
+          echo "--- API RESPONSE ---"
+          echo "$response"
+          echo "--- END TEST ---"
+
+      - name: Check dns_czechia.sh syntax
+        run: bash -n dnsapi/dns_czechia.sh
