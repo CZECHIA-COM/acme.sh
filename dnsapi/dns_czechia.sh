@@ -12,6 +12,13 @@ dns_czechia_info='[
 ]'
 
 dns_czechia_add() {
+  # Vlož toto do dns_czechia.sh (dočasně pro debug) na začátek dns_czechia_add:
+  _info "DEBUG: Prvni parametr (sub): $1"
+  _info "DEBUG: Druhy parametr (domain): $2"
+
+  # A u sestavování URL/BODY:
+  _info "DEBUG: URL, kterou skript stavi: $url"
+  _info "DEBUG: BODY, ktere skript stavi: $body"
   fulldomain="$1"
   txtvalue="$2"
   _czechia_load_conf || return 1
