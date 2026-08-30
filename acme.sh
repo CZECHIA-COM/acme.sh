@@ -1482,39 +1482,57 @@ _readKeyLengthFromCSR() {
   fi
 }
 
+#port
+#Reads a netstat or ss listing on stdin, prints the lines that show a socket
+#listening on port.
+#Linux and windows print the local address as "addr:port", aix, macos, the
+#bsds and solaris print it as "addr.port", so both separators must match.
+#The state is "LISTEN" nearly everywhere, "LISTENING" on windows and lower
+#case "listen" on haiku, hence the substring match and the -i.
+_filter_listen_port() {
+  _flp_port="$1"
+  if [ -z "$_flp_port" ]; then
+    return
+  fi
+  grep -i "LISTEN" | grep "[:.]$_flp_port "
+}
+
+#port
 _ss() {
   _port="$1"
 
   if _exists "ss"; then
     _debug "Using: ss"
-    ss -ntpl 2>/dev/null | grep ":$_port "
+    ss -ntpl 2>/dev/null | _filter_listen_port "$_port"
     return 0
   fi
 
-  if [ "$(uname)" = "AIX" ]; then
-    _debug "Using: AIX netstat"
-    netstat -an | grep "^tcp" | grep "LISTEN" | grep "\.$_port "
+  #aix, macos and the bsds have no "-p protocol" socket listing that works on
+  #all of them: on netbsd "-p" is "Show statistics about protocol" instead
+  #(netstat(1), NetBSD 10.1). Their default display does show "the state of
+  #all sockets" with -a, so use that and keep only the tcp lines.
+  case "$(uname)" in
+  AIX | Darwin | DragonFly | *BSD*)
+    _debug "Using: AIX/BSD netstat"
+    netstat -an | grep "^tcp" | _filter_listen_port "$_port"
     return 0
-  fi
+    ;;
+  esac
 
   if _exists "netstat"; then
     _debug "Using: netstat"
     if netstat -help 2>&1 | grep "\-p proto" >/dev/null; then
       #for windows version netstat tool
-      netstat -an -p tcp | grep "LISTENING" | grep ":$_port "
+      netstat -an -p tcp | _filter_listen_port "$_port"
+    elif netstat -help 2>&1 | grep -- '-P protocol' >/dev/null; then
+      #for solaris
+      netstat -an -P tcp | _filter_listen_port "$_port"
+    elif netstat -help 2>&1 | grep "\-p" >/dev/null; then
+      #for full linux
+      netstat -ntpl | _filter_listen_port "$_port"
     else
-      if netstat -help 2>&1 | grep "\-p protocol" >/dev/null; then
-        netstat -an -p tcp | grep LISTEN | grep ":$_port "
-      elif netstat -help 2>&1 | grep -- '-P protocol' >/dev/null; then
-        #for solaris
-        netstat -an -P tcp | grep "\.$_port " | grep "LISTEN"
-      elif netstat -help 2>&1 | grep "\-p" >/dev/null; then
-        #for full linux
-        netstat -ntpl | grep ":$_port "
-      else
-        #for busybox (embedded linux; no pid support)
-        netstat -ntl 2>/dev/null | grep ":$_port "
-      fi
+      #for busybox (embedded linux; no pid support)
+      netstat -ntl 2>/dev/null | _filter_listen_port "$_port"
     fi
     return 0
   fi
@@ -2499,6 +2517,15 @@ _send_signed_request() {
 
 }
 
+#Reads a value from stdin, prints it escaped for use as the replacement text
+#of a sed s command delimited by '|'. The backslash must go first: a bare one
+#starts an escape sequence and backslash-digit is a backreference, both make
+#sed error out. Then '&' (the whole-match reference) and the '|' delimiter.
+#https://github.com/acmesh-official/acme.sh/issues/7213
+_sed_escape_rhs() {
+  sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g'
+}
+
 #setopt "file"  "opt"  "="  "value" [";"]
 _setopt() {
   __conf="$1"
@@ -2514,34 +2541,50 @@ _setopt() {
     touch "$__conf"
     chmod 600 "$__conf"
   fi
+  __nl="
+"
+  case "$__val" in
+  *"$__nl"*)
+    #the conf format is line based and the file is sourced by the shell, so a
+    #value holding a line break cannot be represented in it (it would also
+    #make the replace sed below fail with an unterminated 's' command)
+    _err "The value of '$__opt' contains a line break, it cannot be saved to $__conf."
+    return 1
+    ;;
+  esac
   if [ -n "$(_tail_c 1 <"$__conf")" ]; then
     echo >>"$__conf"
   fi
 
   if grep -n "^$__opt$__sep" "$__conf" >/dev/null; then
     _debug3 OK
-    if _contains "$__val" "&"; then
-      __val="$(echo "$__val" | sed 's/&/\\&/g')"
-    fi
-    if _contains "$__val" "|"; then
-      __val="$(echo "$__val" | sed 's/|/\\|/g')"
-    fi
+    __val="$(printf -- "%s\n" "$__val" | _sed_escape_rhs)"
     text="$(cat "$__conf")"
-    printf -- "%s\n" "$text" | sed "s|^$__opt$__sep.*$|$__opt$__sep$__val$__end|" >"$__conf"
+    #capture first, write only on success: redirecting sed straight into the
+    #conf file truncates it before sed runs, so a failing sed (e.g. on an
+    #unescaped special character in the value) wiped the whole conf (#2426)
+    if __text="$(printf -- "%s\n" "$text" | sed "s|^$__opt$__sep.*$|$__opt$__sep$__val$__end|")"; then
+      printf -- "%s\n" "$__text" >"$__conf"
+    else
+      _err "Cannot save '$__opt' to $__conf."
+      return 1
+    fi
 
   elif grep -n "^#$__opt$__sep" "$__conf" >/dev/null; then
-    if _contains "$__val" "&"; then
-      __val="$(echo "$__val" | sed 's/&/\\&/g')"
-    fi
-    if _contains "$__val" "|"; then
-      __val="$(echo "$__val" | sed 's/|/\\|/g')"
-    fi
+    __val="$(printf -- "%s\n" "$__val" | _sed_escape_rhs)"
     text="$(cat "$__conf")"
-    printf -- "%s\n" "$text" | sed "s|^#$__opt$__sep.*$|$__opt$__sep$__val$__end|" >"$__conf"
+    if __text="$(printf -- "%s\n" "$text" | sed "s|^#$__opt$__sep.*$|$__opt$__sep$__val$__end|")"; then
+      printf -- "%s\n" "$__text" >"$__conf"
+    else
+      _err "Cannot save '$__opt' to $__conf."
+      return 1
+    fi
 
   else
     _debug3 APP
-    echo "$__opt$__sep$__val$__end" >>"$__conf"
+    #printf, not echo: dash's builtin echo interprets backslash escapes in
+    #the value and would corrupt it
+    printf -- "%s\n" "$__opt$__sep$__val$__end" >>"$__conf"
   fi
   _debug3 "$(grep -n "^$__opt$__sep" "$__conf")"
 }
@@ -2569,7 +2612,9 @@ _clear_conf() {
   _sdkey="$2"
   if [ "$_c_c_f" ]; then
     _conf_data="$(cat "$_c_c_f")"
-    echo "$_conf_data" | sed "/^$_sdkey *=.*$/d" >"$_c_c_f"
+    #printf, not echo: dash's builtin echo interprets backslash escapes and
+    #would corrupt saved values that contain them on every rewrite
+    printf -- "%s\n" "$_conf_data" | sed "/^$_sdkey *=.*$/d" >"$_c_c_f"
   else
     _err "Config file is empty, cannot clear"
   fi
@@ -2715,6 +2760,21 @@ _clearcaconf() {
   _clear_conf "$CA_CONF" "$1"
 }
 
+#Starts a socat listener in the background, the pid is set to _socat_pid.
+#It uses the content, _content_len, _NC and _SOCAT_ERR of _startserver.
+#options
+_startsocat() {
+  _socat_opts="$1"
+  _debug "_NC" "$_NC $_socat_opts"
+  $_NC $_socat_opts SYSTEM:"sleep 1; \
+echo 'HTTP/1.0 200 OK'; \
+echo 'Content-Length\: $_content_len'; \
+echo ''; \
+printf '%s' '$content';" 2>>"$_SOCAT_ERR" &
+  _socat_pid="$!"
+  _debug "_socat_pid" "$_socat_pid"
+}
+
 # content localaddress
 _startserver() {
   content="$1"
@@ -2728,16 +2788,24 @@ _startserver() {
   _debug Le_Listen_V4 "$Le_Listen_V4"
   _debug Le_Listen_V6 "$Le_Listen_V6"
 
+  _serverproc_v6=""
   if _exists "socat"; then
     _NC="socat"
-    if [ "$Le_Listen_V6" ]; then
+    SOCAT_OPTIONS6=""
+    if [ "$Le_Listen_V6" ] && [ -z "$Le_Listen_V4" ]; then
       _NC="$_NC -6"
       SOCAT_OPTIONS=TCP6-LISTEN
-    elif [ "$Le_Listen_V4" ]; then
+    elif [ "$Le_Listen_V4" ] && [ -z "$Le_Listen_V6" ]; then
       _NC="$_NC -4"
       SOCAT_OPTIONS=TCP4-LISTEN
-    else
+    elif [ "$ncaddr" ]; then
+      #a single local address belongs to a single family, let socat pick it
       SOCAT_OPTIONS=TCP-LISTEN
+    else
+      #listen on both ipv4 and ipv6, with one socket for each family:
+      #ipv4-mapped ipv6 addresses are not available everywhere.
+      SOCAT_OPTIONS=TCP4-LISTEN
+      SOCAT_OPTIONS6=TCP6-LISTEN
     fi
 
     if [ "$DEBUG" ] && [ "$DEBUG" -gt "1" ]; then
@@ -2745,6 +2813,10 @@ _startserver() {
     fi
 
     SOCAT_OPTIONS=$SOCAT_OPTIONS:$Le_HTTPPort,crlf,reuseaddr,fork
+    if [ "$SOCAT_OPTIONS6" ]; then
+      #ipv6only keeps this socket from colliding with the ipv4 one
+      SOCAT_OPTIONS6=$SOCAT_OPTIONS6:$Le_HTTPPort,crlf,reuseaddr,fork,ipv6only=1
+    fi
 
     #Adding bind to local-address
     if [ "$ncaddr" ]; then
@@ -2753,14 +2825,14 @@ _startserver() {
 
     _content_len="$(printf "%s" "$content" | wc -c)"
     _debug _content_len "$_content_len"
-    _debug "_NC" "$_NC $SOCAT_OPTIONS"
     export _SOCAT_ERR="$(_mktemp)"
-    $_NC $SOCAT_OPTIONS SYSTEM:"sleep 1; \
-echo 'HTTP/1.0 200 OK'; \
-echo 'Content-Length\: $_content_len'; \
-echo ''; \
-printf '%s' '$content';" 2>"$_SOCAT_ERR" &
-    serverproc="$!"
+    _startsocat "$SOCAT_OPTIONS"
+    serverproc="$_socat_pid"
+    if [ "$SOCAT_OPTIONS6" ]; then
+      #best effort, the host may have no ipv6 support at all
+      _startsocat "$SOCAT_OPTIONS6"
+      _serverproc_v6="$_socat_pid"
+    fi
   else
     _PYTHON=""
     if _exists "python3"; then
@@ -2772,21 +2844,40 @@ printf '%s' '$content';" 2>"$_SOCAT_ERR" &
     fi
     if [ "$_PYTHON" ]; then
       _debug "Using python: $_PYTHON"
-      _AF="socket.AF_INET"
-      _BIND_ADDR="0.0.0.0"
-      if [ "$Le_Listen_V6" ]; then
-        _AF="socket.AF_INET6"
+      #a comma separated list of addresses to listen on, one socket for each
+      _BIND_ADDR="0.0.0.0,::"
+      if [ "$Le_Listen_V6" ] && [ -z "$Le_Listen_V4" ]; then
         _BIND_ADDR="::"
+      elif [ "$Le_Listen_V4" ] && [ -z "$Le_Listen_V6" ]; then
+        _BIND_ADDR="0.0.0.0"
       fi
       if [ "$ncaddr" ]; then
         _BIND_ADDR="$ncaddr"
       fi
+      _debug "_BIND_ADDR" "$_BIND_ADDR"
       export _SOCAT_ERR="$(_mktemp)"
-      $_PYTHON -c "import socket,sys;s=socket.socket($_AF,socket.SOCK_STREAM);s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind((sys.argv[2],int(sys.argv[1])));s.listen(5);res='HTTP/1.0 200 OK\r\nContent-Length: '+str(len(sys.argv[3]))+'\r\n\r\n'+sys.argv[3];
+      $_PYTHON -c "import socket,sys,select
+res='HTTP/1.0 200 OK\r\nContent-Length: '+str(len(sys.argv[3]))+'\r\n\r\n'+sys.argv[3]
+ads=sys.argv[2].split(',')
+ls=[]
+for ad in ads:
+ try:
+  sk=socket.socket(socket.AF_INET6 if ':' in ad else socket.AF_INET,socket.SOCK_STREAM)
+  sk.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+  if ':' in ad and len(ads)>1:
+   sk.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1)
+  sk.bind((ad,int(sys.argv[1])))
+  sk.listen(5)
+  ls.append(sk)
+ except Exception:
+  sys.stderr.write(str(sys.exc_info()[1])+'\n')
+if not ls:
+ sys.exit(1)
 while True:
- c,a=s.accept()
- c.sendall(res.encode() if hasattr(res, 'encode') else res)
- c.close()" "$Le_HTTPPort" "$_BIND_ADDR" "$content" 2>"$_SOCAT_ERR" &
+ for sk in select.select(ls,[],[])[0]:
+  c,a=sk.accept()
+  c.sendall(res.encode() if hasattr(res, 'encode') else res)
+  c.close()" "$Le_HTTPPort" "$_BIND_ADDR" "$content" 2>"$_SOCAT_ERR" &
       serverproc="$!"
       _NC="$_PYTHON"
     else
@@ -2809,6 +2900,11 @@ while True:
 _stopserver() {
   pid="$1"
   _debug "pid" "$pid"
+  if [ "$_serverproc_v6" ]; then
+    _debug "_serverproc_v6" "$_serverproc_v6"
+    kill $_serverproc_v6 >/dev/null 2>&1
+    _serverproc_v6=""
+  fi
   if [ -z "$pid" ]; then
     rm -f "$_SOCAT_ERR"
     return
@@ -2882,9 +2978,11 @@ _starttlsserver() {
 
   _debug Le_Listen_V4 "$Le_Listen_V4"
   _debug Le_Listen_V6 "$Le_Listen_V6"
-  if [ "$Le_Listen_V4" ]; then
+  #openssl s_server binds a single socket, so both options together can only
+  #mean: do not force a family, same as when neither of them is given.
+  if [ "$Le_Listen_V4" ] && [ -z "$Le_Listen_V6" ]; then
     __S_OPENSSL="$__S_OPENSSL -4"
-  elif [ "$Le_Listen_V6" ]; then
+  elif [ "$Le_Listen_V6" ] && [ -z "$Le_Listen_V4" ]; then
     __S_OPENSSL="$__S_OPENSSL -6"
   fi
 
@@ -3857,6 +3955,11 @@ _on_before_issue() {
       netprc="$(echo "$_netprc" | grep "$_checkaddr")"
       if [ -z "$netprc" ]; then
         netprc="$(echo "$_netprc" | grep "$LOCAL_ANY_ADDRESS:$_checkport")"
+      fi
+      if [ -z "$netprc" ]; then
+        #aix, macos, the bsds and solaris print the wildcard local address as
+        #"*.port", not "0.0.0.0:port", and it blocks $_checkaddr just the same
+        netprc="$(echo "$_netprc" | grep " [*][:.]$_checkport ")"
       fi
       if [ "$netprc" ]; then
         _err "$netprc"
@@ -4949,11 +5052,18 @@ issue() {
   if [ -z "$_ACME_IS_RENEW" ]; then
     _initpath "$_main_domain" "$_key_length"
     mkdir -p "$DOMAIN_PATH"
-  elif ! _hasfield "$_web_roots" "$W_DNS"; then
+  elif [ -z "$Le_Vlist" ]; then
+    # Whether the saved order is resumed is decided by Le_Vlist below, so key
+    # this on Le_Vlist too. With no pending order to resume a new one is
+    # created, and a stale order link from the previous issuance must not be
+    # reused. https://github.com/acmesh-official/acme.sh/issues/3635
     Le_OrderFinalize=""
     Le_LinkOrder=""
-    Le_LinkCert=""
   fi
+  # Per-run state only: it is set after finalize and never read back from the
+  # saved domain conf. Carrying it over would make a run that gives up while
+  # the order is still 'processing' download the previous certificate again.
+  Le_LinkCert=""
 
   if _hasfield "$_web_roots" "$W_DNS" && [ -z "$FORCE_DNS_MANUAL" ]; then
     _err "$_DNS_MANUAL_ERROR"
@@ -5979,12 +6089,17 @@ $_authorizations_map"
     _clearaccountconf "HTTPS_INSECURE"
   fi
 
-  if [ "$Le_Listen_V4" ]; then
-    _savedomainconf "Le_Listen_V4" "$Le_Listen_V4"
-    _cleardomainconf Le_Listen_V6
-  elif [ "$Le_Listen_V6" ]; then
-    _savedomainconf "Le_Listen_V6" "$Le_Listen_V6"
-    _cleardomainconf Le_Listen_V4
+  if [ "$Le_Listen_V4" ] || [ "$Le_Listen_V6" ]; then
+    if [ "$Le_Listen_V4" ]; then
+      _savedomainconf "Le_Listen_V4" "$Le_Listen_V4"
+    else
+      _cleardomainconf Le_Listen_V4
+    fi
+    if [ "$Le_Listen_V6" ]; then
+      _savedomainconf "Le_Listen_V6" "$Le_Listen_V6"
+    else
+      _cleardomainconf Le_Listen_V6
+    fi
   fi
 
   if [ "$Le_ForceNewDomainKey" = "1" ]; then
@@ -7007,6 +7122,30 @@ _uninstall_win_taskscheduler() {
   fi
 }
 
+#binpath
+#Reads a crontab listing from stdin, prints it without the acme.sh cron
+#entries that call binpath.
+_filter_cron_bin() {
+  _fcb_bin="$1"
+  if [ -z "$_fcb_bin" ]; then
+    cat
+    return
+  fi
+  #a case pattern with a quoted variable matches binpath literally, which
+  #grep cannot do portably: Solaris /usr/bin/grep has no -F, and as a regex
+  #the dot of ~/.acme.sh would stand for any character
+  while IFS= read -r _fcb_line || [ -n "$_fcb_line" ]; do
+    case "$_fcb_line" in
+    *"$_fcb_bin --cron"*)
+      _debug3 "Dropping cron entry" "$_fcb_line"
+      ;;
+    *)
+      echo "$_fcb_line"
+      ;;
+    esac
+  done
+}
+
 #confighome
 installcronjob() {
   _c_home="$1"
@@ -7076,7 +7215,26 @@ installcronjob() {
       return 1
     fi
   fi
-  if ! echo "$_cron_entries" | grep "$PROJECT_ENTRY --cron"; then
+  #An entry that calls LE_WORKING_DIR/PROJECT_ENTRY is dead once that copy is
+  #gone: ACME_PACKAGED installs never write it, and the package manager
+  #removes it when it takes over. The entry below would then keep the install
+  #from adding a working one and cron would fail silently every day, so drop
+  #the stale entries first.
+  _cron_stale=""
+  if [ ! -f "$LE_WORKING_DIR/$PROJECT_ENTRY" ] && [ "$_cron_entries" ]; then
+    _cron_kept="$(echo "$_cron_entries" | _filter_cron_bin "\"$LE_WORKING_DIR\"/$PROJECT_ENTRY")"
+    if [ "$_cron_kept" != "$_cron_entries" ]; then
+      _info "Removing the cron job that calls the missing $LE_WORKING_DIR/$PROJECT_ENTRY"
+      _cron_entries="$_cron_kept"
+      _cron_stale=1
+    fi
+  fi
+  #>/dev/null: grep would print the matching crontab line to the console
+  _cron_add=""
+  if ! echo "$_cron_entries" | grep "$PROJECT_ENTRY --cron" >/dev/null; then
+    _cron_add=1
+  fi
+  if [ "$_cron_add" ] || [ "$_cron_stale" ]; then
     if _exists uname && uname -a | grep SunOS >/dev/null; then
       _CRONTAB_STDIN="$_CRONTAB --"
     else
@@ -7086,7 +7244,9 @@ installcronjob() {
       if [ "$_cron_entries" ]; then
         echo "$_cron_entries"
       fi
-      echo "$_cron_entry"
+      if [ "$_cron_add" ]; then
+        echo "$_cron_entry"
+      fi
     } | $_CRONTAB_STDIN
   fi
   if [ "$?" != "0" ]; then
@@ -8165,8 +8325,9 @@ Parameters:
   --ocsp, --ocsp-must-staple        Generate OCSP-Must-Staple extension.
   --always-force-new-domain-key     Generate new domain key on renewal. Otherwise, the domain key is not changed by default.
   --auto-upgrade [0|1]              Valid for '--upgrade' command, indicating whether to upgrade automatically in future. Defaults to 1 if argument is omitted.
-  --listen-v4                       Force standalone/tls server to listen at ipv4.
-  --listen-v6                       Force standalone/tls server to listen at ipv6.
+  --listen-v4                       Force standalone/tls server to listen at ipv4 only.
+                                      By default the standalone server listens on both ipv4 and ipv6.
+  --listen-v6                       Force standalone/tls server to listen at ipv6 only.
   --request-v4                      Force client requests to use ipv4 to connect to the CA server.
   --request-v6                      Force client requests to use ipv6 to connect to the CA server.
   --openssl-bin <file>              Specifies a custom openssl bin location.
